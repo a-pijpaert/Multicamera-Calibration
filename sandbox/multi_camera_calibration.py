@@ -1,10 +1,7 @@
 import numpy as np
 import cv2
-from cv2 import aruco
-import glob
 import pickle
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d import art3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -73,10 +70,9 @@ class MultiCameraCalibrator:
         object_points = []
         image_size = None
         
-        # # Get reference camera ID (first camera) TODO: change this based on an input
-        # ref_cam_id = list(image_sets.keys())[0]
-        
-        # Process all images
+
+    
+        # Process all images for marker detection
         num_images = len(image_sets[self.ref_cam_id])
         for frame_idx in range(num_images):
             frame_corners = {}
@@ -103,69 +99,99 @@ class MultiCameraCalibrator:
             
             if not valid_frame:
                 continue
-            
-            # Find common points across all cameras
-            common_ids = set(frame_ids[self.ref_cam_id].ravel())
-            for cam_id in image_sets.keys():
-                if cam_id != self.ref_cam_id:
-                    common_ids &= set(frame_ids[cam_id].ravel())
-            
-            if not common_ids:
-                continue
                 
-            # Get object and image points for common IDs
-            common_ids = sorted(list(common_ids))
-            board_points = self.board.getChessboardCorners()
-            obj_points = board_points[common_ids].astype(np.float32)
-            
-            # Store points for each camera
+            # Store detected corners and IDs for each camera
             for cam_id in image_sets.keys():
-                cam_ids = frame_ids[cam_id].ravel()
-                idx = [list(cam_ids).index(id) for id in common_ids]
-                all_corners[cam_id].append(frame_corners[cam_id][idx])
-                all_ids[cam_id].append(np.array(common_ids))
-                if len(object_points) < len(all_corners[self.ref_cam_id]):
+                all_corners[cam_id].append(frame_corners[cam_id])
+                all_ids[cam_id].append(frame_ids[cam_id].ravel())
+                
+                # Generate object points if needed
+                if len(object_points) < len(all_corners[cam_id]):
+                    board_points = self.board.getChessboardCorners()
+                    obj_points = board_points[frame_ids[cam_id].ravel()].astype(np.float32)
                     object_points.append(obj_points)
-        
-        # Calibrate each camera individually first
+
+        # Step 2: Single camera calibration
         for cam_id in image_sets.keys():
+            # Prepare calibration data for this camera
+            cam_object_points = []
+            cam_image_points = []
+            
+            for frame_idx in range(len(all_ids[cam_id])):
+                frame_ids = all_ids[cam_id][frame_idx]
+                frame_corners = all_corners[cam_id][frame_idx]
+                
+                # Generate object points for the detected IDs
+                board_points = self.board.getChessboardCorners()
+                obj_points = board_points[frame_ids].astype(np.float32)
+                
+                cam_object_points.append(obj_points)
+                cam_image_points.append(frame_corners)
+            
+            # Perform single camera calibration
             ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
-                object_points,
-                all_corners[cam_id],
+                cam_object_points,
+                cam_image_points,
                 image_size,
                 None,
                 None
             )
+            
             self.cameras[cam_id] = {
                 'matrix': mtx,
                 'dist_coeffs': dist,
                 'rvecs': rvecs,
-                'tvecs': tvecs
+                'tvecs': tvecs,
+                'all_corners': all_corners[cam_id],
+                'all_ids': all_ids[cam_id]
             }
-        
-        # Perform stereo calibration between reference camera and each other camera
+            print(f'Reprojection error of {cam_id}: {ret}')
+
+        # Step 3: Stereo calibration for each camera pair
         ref_matrix = self.cameras[self.ref_cam_id]['matrix']
         ref_dist = self.cameras[self.ref_cam_id]['dist_coeffs']
         
+        # Store identity transform for reference camera
+        self.cameras[self.ref_cam_id].update({
+            'R': np.eye(3),
+            'T': np.zeros((3, 1)),
+            'E': None,
+            'F': None
+        })
+        
+        # Process each non-reference camera
         for cam_id in image_sets.keys():
-            self.cameras[cam_id].update({
-                'all_corners': all_corners[cam_id],
-                'all_ids': all_ids[cam_id]
-            })
             if cam_id == self.ref_cam_id:
-                # Store identity transform for reference camera
-                self.cameras[cam_id].update({
-                    'R': np.eye(3),
-                    'T': np.zeros((3, 1)),
-                    'E': None,
-                    'F': None
-                })
                 continue
                 
+            # Find common IDs between reference and current camera
+            stereo_object_points = []
+            stereo_ref_corners = []
+            stereo_cam_corners = []
+            
+            for frame_idx in range(len(all_ids[self.ref_cam_id])):
+                ref_frame_ids = all_ids[self.ref_cam_id][frame_idx]
+                cam_frame_ids = all_ids[cam_id][frame_idx]
+                common_ids = np.intersect1d(ref_frame_ids, cam_frame_ids)
+                
+                if len(common_ids) > 0:
+                    # Get indices for common IDs in both cameras
+                    ref_idx = np.array([np.where(ref_frame_ids == id)[0][0] for id in common_ids])
+                    cam_idx = np.array([np.where(cam_frame_ids == id)[0][0] for id in common_ids])
+                    
+                    # Get object points for common IDs
+                    board_points = self.board.getChessboardCorners()
+                    obj_points = board_points[common_ids].astype(np.float32)
+                    
+                    stereo_object_points.append(obj_points)
+                    stereo_ref_corners.append(all_corners[self.ref_cam_id][frame_idx][ref_idx])
+                    stereo_cam_corners.append(all_corners[cam_id][frame_idx][cam_idx])
+            
+            # Perform stereo calibration
             ret, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
-                object_points,
-                all_corners[self.ref_cam_id],
-                all_corners[cam_id],
+                stereo_object_points,
+                stereo_ref_corners,
+                stereo_cam_corners,
                 ref_matrix,
                 ref_dist,
                 self.cameras[cam_id]['matrix'],
@@ -183,37 +209,120 @@ class MultiCameraCalibrator:
                 'E': E,
                 'F': F
             })
+            print(f'Stereo reprojection error of {self.ref_cam_id} and {cam_id}: {ret}')
 
-    # def draw_coordinate_system(self, ax, position, rotation_matrix, scale=20, label=""):
-    #     """
-    #     Draw coordinate system axes at given position with given orientation
-    #     Red = X, Green = Y, Blue = Z
-    #     """
-    #     # Define the axes endpoints in local coordinates
-    #     axes = np.array([[scale, 0, 0],  # X-axis
-    #                     [0, scale, 0],  # Y-axis
-    #                     [0, 0, scale]]) # Z-axis
+
+        # # Process all images
+        # num_images = len(image_sets[self.ref_cam_id])
+        # for frame_idx in range(num_images):
+        #     frame_corners = {}
+        #     frame_ids = {}
+        #     valid_frame = True
+            
+        #     # Detect markers in all cameras for this frame
+        #     for cam_id, images in image_sets.items():
+        #         if frame_idx >= len(images):
+        #             valid_frame = False
+        #             break
+                    
+        #         image, corners, ids = self.detect_markers(images[frame_idx])
+                
+        #         if corners is None or ids is None:
+        #             valid_frame = False
+        #             break
+                
+        #         if image_size is None:
+        #             image_size = image.shape[:2][::-1]
+                
+        #         frame_corners[cam_id] = corners
+        #         frame_ids[cam_id] = ids
+            
+        #     if not valid_frame:
+        #         continue
+            
+        #     # Find common points across all cameras
+        #     common_ids = set(frame_ids[self.ref_cam_id].ravel())
+        #     for cam_id in image_sets.keys():
+        #         if cam_id != self.ref_cam_id:
+        #             common_ids &= set(frame_ids[cam_id].ravel())
+            
+        #     if not common_ids:
+        #         continue
+                
+        #     # Get object and image points for common IDs
+        #     common_ids = sorted(list(common_ids))
+        #     board_points = self.board.getChessboardCorners()
+        #     obj_points = board_points[common_ids].astype(np.float32)
+            
+        #     # Store points for each camera
+        #     for cam_id in image_sets.keys():
+        #         cam_ids = frame_ids[cam_id].ravel()
+        #         idx = [list(cam_ids).index(id) for id in common_ids]
+        #         all_corners[cam_id].append(frame_corners[cam_id][idx])
+        #         all_ids[cam_id].append(np.array(common_ids))
+        #         if len(object_points) < len(all_corners[self.ref_cam_id]):
+        #             object_points.append(obj_points)
         
-    #     # Transform endpoints to world coordinates
-    #     axes_world = np.dot(rotation_matrix, axes.T).T + position
+        # # Calibrate each camera individually first
+        # for cam_id in image_sets.keys():
+        #     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
+        #         object_points,
+        #         all_corners[cam_id],
+        #         image_size,
+        #         None,
+        #         None
+        #     )
+        #     self.cameras[cam_id] = {
+        #         'matrix': mtx,
+        #         'dist_coeffs': dist,
+        #         'rvecs': rvecs,
+        #         'tvecs': tvecs
+        #     }
+        #     print(f'Reprojection error of {cam_id}: {ret}')
+
+        # # Perform stereo calibration between reference camera and each other camera
+        # ref_matrix = self.cameras[self.ref_cam_id]['matrix']
+        # ref_dist = self.cameras[self.ref_cam_id]['dist_coeffs']
         
-    #     # Plot each axis
-    #     colors = ['red', 'green', 'blue']
-    #     # labels = [f'{label} X', f'{label} Y', f'{label} Z'] if label else ['X', 'Y', 'Z']
-        
-    #     for i, color in enumerate(colors):
-    #         ax.quiver(position[0], position[1], position[2],
-    #                 axes_world[i,0] - position[0],
-    #                 axes_world[i,1] - position[1],
-    #                 axes_world[i,2] - position[2],
-    #                 color=color, label=label)
-    #     if label:
-    #         ax.text(
-    #             position[0], position[1], position[2],
-    #             label,
-    #             fontsize=12,
-    #             color='black'
-    #         )
+        # for cam_id in image_sets.keys():
+        #     self.cameras[cam_id].update({
+        #         'all_corners': all_corners[cam_id],
+        #         'all_ids': all_ids[cam_id]
+        #     })
+        #     if cam_id == self.ref_cam_id:
+        #         # Store identity transform for reference camera
+        #         self.cameras[cam_id].update({
+        #             'R': np.eye(3),
+        #             'T': np.zeros((3, 1)),
+        #             'E': None,
+        #             'F': None
+        #         })
+        #         continue
+                
+        #     ret, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
+        #         object_points,
+        #         all_corners[self.ref_cam_id],
+        #         all_corners[cam_id],
+        #         ref_matrix,
+        #         ref_dist,
+        #         self.cameras[cam_id]['matrix'],
+        #         self.cameras[cam_id]['dist_coeffs'],
+        #         image_size,
+        #         None,
+        #         None,
+        #         None,
+        #         flags=cv2.CALIB_FIX_INTRINSIC
+        #     )
+            
+        #     self.cameras[cam_id].update({
+        #         'R': R,
+        #         'T': T,
+        #         'E': E,
+        #         'F': F
+        #     })
+
+        #     print(f'Stereo reprojection error of {self.ref_cam_id} and {cam_id}: {ret}')
+
     
     def draw_board_plane(self, ax, position, rotation_matrix, color, alpha=0.3, label=""):
         """
@@ -279,7 +388,7 @@ class MultiCameraCalibrator:
         
         return board_positions
 
-    def plot_camera(self, ax, position=(0, 0, 0), rotation=np.eye(3), size=1, color='blue'):
+    def plot_camera(self, ax, position=(0, 0, 0), rotation=np.eye(3), size=1, color='lightblue', label=''):
         """
         Plot a 3D camera representation.
         
@@ -325,6 +434,14 @@ class MultiCameraCalibrator:
         ax.quiver(*position, *arrows[1], color='green')
         ax.quiver(*position, *arrows[2], color='blue')
 
+        if label:
+            ax.text(
+                position[0], position[1], position[2],
+                label,
+                fontsize=12,
+                color='black'
+            )
+
     def visualize_setup(self):
         """Visualize the multi-camera setup"""
         fig = plt.figure(figsize=(12, 12))
@@ -344,7 +461,7 @@ class MultiCameraCalibrator:
                 position = -np.dot(rotation.T, translation)
             
             # self.draw_coordinate_system(ax, position, rotation, label=cam_id)
-            self.plot_camera(ax, position, np.linalg.inv(rotation), size=20)
+            self.plot_camera(ax, position, np.linalg.inv(rotation), size=20, label=cam_id, color=color)
 
         # Get board positions
         board_positions = self.calculate_board_positions()
@@ -387,31 +504,3 @@ class MultiCameraCalibrator:
         """Load calibration results"""
         with open(filename, 'rb') as f:
             self.cameras = pickle.load(f)
-
-def main():
-    # Create calibrator
-    calibrator = MultiCameraCalibrator(ref_cam_id='cam4', show_detection_flag=False)
-    
-    # Define image sets for each camera
-    image_sets = {
-        'cam1': sorted(glob.glob('images/camera1/*.png')),
-        'cam2': sorted(glob.glob('images/camera2/*.png')),
-        'cam3': sorted(glob.glob('images/camera3/*.png')),  
-        'cam4': sorted(glob.glob('images/camera4/*.png')),  # Add more cameras as needed
-    }
-    
-    # Perform calibration
-    print("Calibrating cameras...")
-    calibrator.calibrate_cameras(image_sets)
-    
-    # Save results
-    calibrator.save_calibration()
-    
-    # Visualize setup
-    print("Creating visualization...")
-    fig, ax = calibrator.visualize_setup()
-    plt.savefig('multi_camera_setup.png', dpi=300, bbox_inches='tight')
-    plt.show()
-
-if __name__ == "__main__":
-    main()
